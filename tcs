@@ -1,0 +1,114 @@
+import numpy as np
+import os
+import json
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, TimeDistributed
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from scipy.spatial.transform import Rotation as R
+
+# Paths and parameters
+dataset_path = 'data/sped_dataset/'  # Replace with the actual path to the SPED dataset
+image_size = (224, 224)  # Image size for ResNet50
+sequence_length = 10  # Length of image sequences
+output_size = 3  # Number of angular velocities to predict (yaw, pitch, roll)
+
+# Function to load and preprocess images
+def load_and_preprocess_image(image_path):
+    image = load_img(image_path, target_size=image_size)
+    image_array = img_to_array(image)
+    image_array = tf.keras.applications.resnet50.preprocess_input(image_array)
+    return image_array
+
+# Load dataset labels (assuming a JSON file or similar structure)
+labels_path = os.path.join(dataset_path, 'labels.json')
+with open(labels_path, 'r') as f:
+    labels_data = json.load(f)
+
+# Placeholder for processed data
+image_sequences = []
+quaternions = []
+timestamps = []
+
+# Process each sequence in the dataset
+for sequence in labels_data:
+    images = []
+    quats = []
+    times = []
+    
+    for frame in sequence['frames']:
+        image_path = os.path.join(dataset_path, frame['image'])
+        quat = frame['quaternion']
+        timestamp = frame['timestamp']
+        
+        images.append(load_and_preprocess_image(image_path))
+        quats.append(quat)
+        times.append(timestamp)
+    
+    image_sequences.append(images)
+    quaternions.append(quats)
+    timestamps.append(times)
+
+# Convert to numpy arrays
+image_sequences = np.array(image_sequences)
+quaternions = np.array(quaternions)
+timestamps = np.array(timestamps)
+
+# Extract features using ResNet50
+resnet_model = ResNet50(weights='imagenet', include_top=False, input_shape=(*image_size, 3))
+feature_extractor = tf.keras.Model(inputs=resnet_model.input, outputs=tf.keras.layers.GlobalAveragePooling2D()(resnet_model.output))
+
+# Extract features for each image in the sequences
+features = []
+for seq in image_sequences:
+    seq_features = [feature_extractor.predict(np.expand_dims(img, axis=0))[0] for img in seq]
+    features.append(seq_features)
+
+features = np.array(features)
+
+# Function to compute angular velocities
+def compute_angular_velocity(quaternions, time_stamps):
+    angular_velocities = []
+    for i in range(1, len(quaternions)):
+        q1 = R.from_quat(quaternions[i - 1])
+        q2 = R.from_quat(quaternions[i])
+        delta_t = time_stamps[i] - time_stamps[i - 1]
+
+        delta_q = q2 * q1.inv()
+        angle = np.linalg.norm(delta_q.as_rotvec())
+        axis = delta_q.as_rotvec() / angle if angle != 0 else [0, 0, 0]
+        
+        angular_velocity = (angle / delta_t) * np.array(axis)
+        angular_velocities.append(angular_velocity)
+
+    return np.array(angular_velocities)
+
+# Compute angular velocities for each sequence
+angular_velocity_sequences = []
+for seq_quats, seq_times in zip(quaternions, timestamps):
+    ang_vel = compute_angular_velocity(seq_quats, seq_times)
+    # Padding with zeros for the first element (to match the sequence length)
+    padded_ang_vel = np.vstack(([0, 0, 0], ang_vel))
+    angular_velocity_sequences.append(padded_ang_vel)
+
+angular_velocity_sequences = np.array(angular_velocity_sequences)
+
+# Define the model
+model = Sequential()
+model.add(LSTM(256, input_shape=(sequence_length, features.shape[-1]), return_sequences=True))
+model.add(TimeDistributed(Dense(output_size)))
+
+# Compile the model
+model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
+# Train the model
+model.fit(features, angular_velocity_sequences, epochs=20, batch_size=32, validation_split=0.2)
+
+# Save the model
+model.save('pose_estimation_with_angular_velocity.h5')
+
+print("Model training complete and saved as 'pose_estimation_with_angular_velocity.h5'")
+
+# Predict angular velocities for new sequences of images
+# Example: model.predict(new_image_feature_sequence)
