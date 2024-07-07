@@ -1,267 +1,237 @@
-import numpy as np
 import os
-import json
+import numpy as np
+import pandas as pd
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense, LSTM, TimeDistributed, GlobalAveragePooling2D
-from tensorflow.keras.applications import ResNet50
-from scipy.spatial.transform import Rotation as R
+from tensorflow.keras.models import Model, Sequential
+from tensorflow.keras.layers import Input, Dense, Conv2D, Flatten, MaxPooling2D, LSTM, TimeDistributed, Concatenate, Dropout
+from tensorflow.keras.applications import InceptionResNetV2
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
-import time
+from scipy.spatial.transform import Rotation as R
+import cv2
 
-# Base paths and parameters
-dataset_path = '/content/sample_data/speed'  # Replace with the actual path to the SPED dataset
-image_size = (224, 224)  # Image size for ResNet50
-sequence_length = 10  # Length of image sequences
-output_size = 3  # Number of angular velocities to predict (yaw, pitch, roll)
-angular_velocity_save_path = '/content/sample_data/angular_velocities.json'  # Path to save angular velocities
+# Mount Google Drive to access files
+from google.colab import drive
+drive.mount('/content/drive')
 
-# Function to get the labels path based on the dataset type
-def get_labels_path(dataset_type):
-    if dataset_type == 'real':
-        return os.path.join(dataset_path, 'real.json')
-    elif dataset_type == 'real_test':
-        return os.path.join(dataset_path, 'real_test.json')
-    elif dataset_type == 'test':
-        return os.path.join(dataset_path, 'test.json')
-    elif dataset_type == 'train':
-        return os.path.join(dataset_path, 'train.json')
-    else:
-        raise ValueError("Invalid dataset type. Choose from 'real', 'real_test', 'test', or 'train'.")
+# Define paths to your data files
+base_path = '/content/drive/MyDrive/'  # Update this to your drive path
+image_data_file = os.path.join(base_path, 'data.npy')
+angular_momentum_file = os.path.join(base_path, 'data_pi.npy')
+rotation_matrix_file = os.path.join(base_path, 'data_R.npy')
 
-# Example usage: Set labels_path for 'train' dataset
-dataset_type = 'train'  # Choose the dataset you want to work with: 'real', 'real_test', 'test', 'train'
-labels_path = get_labels_path(dataset_type)
+# Load data
+image_data = np.fromfile(image_data_file, dtype=np.float64) # Shape: (1505280016,)
+angular_momentum_data = np.fromfile(angular_momentum_file, dtype=np.float64)  # Shape: (30016,)
+rotation_matrix_data = np.fromfile(rotation_matrix_file, dtype=np.float64)   # Shape: (90016,)
 
-print("Labels Path:", labels_path)
+# Verify initial shape and size
+print(f"Initial shape of image_data: {image_data.shape}")
+print(f"Initial size of image_data: {image_data.size}")
 
-# Function to load and preprocess images for ResNet50
-IMAGE_SIZE = (224, 224)
-AUTOTUNE = tf.data.AUTOTUNE
+print(f"Initial shape of angular_momentum_data: {angular_momentum_data.shape}")
+print(f"Initial size of angular_momentum_data: {angular_momentum_data.size}")
 
-@tf.function
-def get_image(filenames):
-    image = tf.io.read_file(filenames)
-    image = tf.image.decode_jpeg(image, channels=3)
-    image = tf.image.resize(image, IMAGE_SIZE)
-    image = tf.keras.applications.resnet50.preprocess_input(image)
-    return image
+print(f"Initial shape of rotation_matrix_data: {rotation_matrix_data.shape}")
+print(f"Initial size of rotation_matrix_data: {rotation_matrix_data.size}")
 
-# Function to create sequences of data
-def in_sequence(data, sequence_length):
-    data = data.window(sequence_length, shift=1, drop_remainder=True)
-    data = data.flat_map(lambda window: window.batch(sequence_length))
-    return data
+# Remove the first 16 elements from image_data, angular_momentum_data, and rotation_matrix_data
+image_data = image_data[16:]
+angular_momentum_data = angular_momentum_data[16:]
+rotation_matrix_data = rotation_matrix_data[16:]
 
-# Data loader function to create a TensorFlow dataset
-def dataloader(labels, sequence_length=5, batch_size=64, type_data="train"):
-    tensors = {
-        "filename": tf.convert_to_tensor([f"/content/sample_data/speed/images/{type_data}/{d['filename']}" for d in labels]),
-        "q_vbs2tango": tf.convert_to_tensor([d["q_vbs2tango"] for d in labels]),
-        "r_Vo2To_vbs_true": tf.convert_to_tensor([d["r_Vo2To_vbs_true"] for d in labels]),
-    }
+# Verify the new shape and size after removing elements
+print(f"Shape of image_data after removing first 16 elements: {image_data.shape}")
+print(f"Size of image_data after removing first 16 elements: {image_data.size}")
 
-    files = tf.data.Dataset.from_tensor_slices(tensors['filename'])
-    files = files.map(get_image, num_parallel_calls=AUTOTUNE)
-    quaternions = tf.data.Dataset.from_tensor_slices(tensors['q_vbs2tango'])
-    positions = tf.data.Dataset.from_tensor_slices(tensors['r_Vo2To_vbs_true'])
-    
-    files = in_sequence(files, sequence_length)
-    quaternions = in_sequence(quaternions, sequence_length)
-    positions = in_sequence(positions, sequence_length)
-    data = tf.data.Dataset.zip((files, quaternions, positions))
-    data = data.batch(batch_size)
-    data = data.prefetch(AUTOTUNE)
-    return data
+print(f"Shape of angular_momentum_data after removing first 16 elements: {angular_momentum_data.shape}")
+print(f"Size of angular_momentum_data after removing first 16 elements: {angular_momentum_data.size}")
 
-# Load dataset labels
-with open(labels_path, 'r') as f:
-    labels_data = json.load(f)
+print(f"Shape of rotation_matrix_data after removing first 16 elements: {rotation_matrix_data.shape}")
+print(f"Size of rotation_matrix_data after removing first 16 elements: {rotation_matrix_data.size}")
 
-# Print the first item to understand its layout
-print(json.dumps(labels_data[0], indent=4))
+# Reshape to the expected shapes
+num_sequences = 100
+num_images = 100
+image_data = image_data.reshape(num_sequences, num_images, 224, 224, 3)
+angular_momentum_data = angular_momentum_data.reshape(num_sequences, num_images, 3)
+rotation_matrix_data = rotation_matrix_data.reshape(num_sequences, num_images, 3, 3)
 
-# Define a function to compute angular velocities from quaternions
-def compute_angular_velocity(quaternions, time_stamps):
+# Resize images to (180, 320) with padding to maintain aspect ratio
+def resize_and_pad(img, target_size):
+    h, w, _ = img.shape
+    scale = min(target_size[1] / w, target_size[0] / h)
+    new_w, new_h = int(w * scale), int(h * scale)
+    resized_img = cv2.resize(img, (new_w, new_h))
+    top_pad = (target_size[0] - new_h) // 2
+    bottom_pad = target_size[0] - new_h - top_pad
+    left_pad = (target_size[1] - new_w) // 2
+    right_pad = target_size[1] - new_w - left_pad
+    padded_img = cv2.copyMakeBorder(resized_img, top_pad, bottom_pad, left_pad, right_pad, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+    return padded_img
+
+target_size = (180, 320)
+resized_image_data = np.zeros((num_sequences, num_images, target_size[0], target_size[1], 3), dtype=np.float32)
+for i in range(num_sequences):
+    for j in range(num_images):
+        resized_image_data[i, j] = resize_and_pad(image_data[i, j], target_size)
+
+# Verify the new shape and size after reshaping
+print(f"Shape of resized_image_data after reshaping: {resized_image_data.shape}")
+print(f"Size of resized_image_data after reshaping: {resized_image_data.size}")
+
+# Check the structure of the resized image data
+print(f"Shape of resized_image_data: {resized_image_data.shape}")
+print(f"Data type of resized_image_data: {resized_image_data.dtype}")
+
+# Normalize the image data
+resized_image_data = resized_image_data.astype('float32') / 255.0
+
+# Normalize the angular momentum and rotation matrix data
+scaler_am = StandardScaler()
+angular_momentum_data = scaler_am.fit_transform(angular_momentum_data.reshape(-1, angular_momentum_data.shape[-1])).reshape(angular_momentum_data.shape)
+
+scaler_rm = StandardScaler()
+rotation_matrix_data = scaler_rm.fit_transform(rotation_matrix_data.reshape(-1, rotation_matrix_data.shape[-1])).reshape(rotation_matrix_data.shape)
+
+# Calculate angular velocity from rotation matrices
+def compute_angular_velocity(rotation_matrices, delta_t=1.0):
     angular_velocities = []
-    for i in range(1, len(quaternions)):
-        q1 = R.from_quat(quaternions[i - 1])
-        q2 = R.from_quat(quaternions[i])
-        delta_t = time_stamps[i] - time_stamps[i - 1]
-
-        delta_q = q2 * q1.inv()
-        angle = np.linalg.norm(delta_q.as_rotvec())
-        axis = delta_q.as_rotvec() / angle if angle != 0 else [0, 0, 0]
-        
-        angular_velocity = (angle / delta_t) * np.array(axis)
-        angular_velocities.append(angular_velocity)
-
+    for seq in rotation_matrices:
+        seq_angular_velocity = []
+        for i in range(len(seq) - 1):
+            r1 = R.from_matrix(seq[i])
+            r2 = R.from_matrix(seq[i + 1])
+            delta_r = r2 * r1.inv()
+            angular_velocity = delta_r.as_rotvec() / delta_t
+            seq_angular_velocity.append(angular_velocity)
+        seq_angular_velocity.append(seq_angular_velocity[-1])  # repeat last velocity for equal length
+        angular_velocities.append(seq_angular_velocity)
     return np.array(angular_velocities)
 
-# Function to define and compile the model
+# Calculate angular velocity
+angular_velocity_data = compute_angular_velocity(rotation_matrix_data)
+
+# Reshape the data to have sequences of 10 images each
+def reshape_sequences(data, seq_length):
+    num_sequences, num_images = data.shape[:2]
+    reshaped_data = []
+    for seq in range(num_sequences):
+        for start in range(0, num_images, seq_length):
+            end = start + seq_length
+            if end <= num_images:
+                reshaped_data.append(data[seq, start:end])
+    return np.array(reshaped_data)
+
+# Reshape image, angular momentum, and angular velocity data
+seq_length = 10
+image_data_reshaped = reshape_sequences(resized_image_data, seq_length)
+angular_momentum_data_reshaped = reshape_sequences(angular_momentum_data, seq_length)
+angular_velocity_data_reshaped = reshape_sequences(angular_velocity_data, seq_length)
+
+# Extract the 10th angular velocity for each smaller sequence as the target
+target_angular_velocity = angular_velocity_data_reshaped[:, -1, :]
+
+# Split data into training and testing sets
+train_indices, test_indices = train_test_split(np.arange(image_data_reshaped.shape[0]), test_size=0.2, random_state=42)
+
+train_sequences = image_data_reshaped[train_indices]
+test_sequences = image_data_reshaped[test_indices]
+
+train_ic_am = angular_momentum_data_reshaped[train_indices, 0, :]
+test_ic_am = angular_momentum_data_reshaped[test_indices, 0, :]
+
+train_av = target_angular_velocity[train_indices]
+test_av = target_angular_velocity[test_indices]
+
+# Define the model creation function
 def create_model():
-    resnet_base = ResNet50(weights='imagenet', include_top=False, input_shape=(*image_size, 3))
-    resnet_model = Sequential([
-        resnet_base,
-        GlobalAveragePooling2D()
-    ])
-    time_distributed_resnet = TimeDistributed(resnet_model)
-    
+    inception_resnet = InceptionResNetV2(include_top=False, weights="imagenet", input_shape=(180, 320, 3))
+    for layer in inception_resnet.layers[:-4]:
+        layer.trainable = False
+
     model = Sequential()
-    model.add(time_distributed_resnet)
-    model.add(LSTM(256, return_sequences=True))
-    model.add(TimeDistributed(Dense(output_size)))
-    
-    # Compile the model
-    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    model.add(TimeDistributed(inception_resnet, input_shape=(seq_length, 180, 320, 3)))
+    model.add(TimeDistributed(Flatten()))
+    model.add(LSTM(256, activation='relu', return_sequences=False))
+    model.add(Dropout(0.5))
+    model.add(Dense(64, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(3))  # Final layer is of 3 neurons for angular velocity components
+
     return model
 
-# Function to train and evaluate the model on a single train/validation split
-def train_and_evaluate(train_labels, val_labels, fold_index):
-    # Create data loaders for training and validation sets
-    train_dataset = dataloader(train_labels, sequence_length=sequence_length, batch_size=64, type_data=dataset_type)
-    val_dataset = dataloader(val_labels, sequence_length=sequence_length, batch_size=64, type_data=dataset_type)
-    
+# Custom loss function
+class CustomAngularVelocityLoss(tf.keras.losses.Loss):
+    def call(self, y_true, y_pred):
+        e = y_pred - y_true
+        euclidean_distance = tf.sqrt(tf.reduce_sum(tf.square(e), axis=-1))
+        integral_loss = tf.reduce_mean(euclidean_distance)
+        return integral_loss
+
+# Use a distributed strategy for training
+strategy = tf.distribute.MirroredStrategy()
+
+with strategy.scope():
     # Define and compile the model
     model = create_model()
-    
-    # Training the model
-    all_angular_velocities = []  # Reset for each fold
+    optimizer = tf.keras.optimizers.Adam()
+    model.compile(optimizer=optimizer, loss=CustomAngularVelocityLoss(), metrics=['mae'])
 
-    for image_batch, quat_batch, pos_batch in train_dataset:
-        angular_velocity_sequences = []
-        timestamps = np.arange(sequence_length) * 0.1  # Dummy timestamps for each sequence
-        
-        for quat_seq in quat_batch:
-            ang_vel = compute_angular_velocity(quat_seq.numpy(), timestamps)
-            padded_ang_vel = np.vstack(([0, 0, 0], ang_vel))
-            angular_velocity_sequences.append(padded_ang_vel)
-        
-        angular_velocity_sequences = np.array(angular_velocity_sequences)
-        model.fit(image_batch, angular_velocity_sequences, epochs=1, batch_size=64, verbose=1)
+    # Train the model
+    model.fit(train_sequences, train_av, validation_split=0.2, batch_size=8, epochs=10)
 
-    # Save the model for this fold
-    model_path = f'pose_estimation_with_angular_velocity_fold_{fold_index}.h5'
-    model.save(model_path)
-    print(f"Model saved to {model_path}")
-    
-    # Evaluate the model on the validation set
-    all_predicted_angular_velocities = []
-    all_true_angular_velocities = []
+# Save the model and weights
+model_save_path = '/content/trained_model_10epoch.h5'
+weights_save_path = '/content/trained_model_10epoch_weights.h5'
 
-    for val_image_batch, val_quat_batch, val_pos_batch in val_dataset:
-        true_angular_velocity_sequences = []
-        timestamps = np.arange(sequence_length) * 0.1
-        
-        for quat_seq in val_quat_batch:
-            true_ang_vel = compute_angular_velocity(quat_seq.numpy(), timestamps)
-            padded_true_ang_vel = np.vstack(([0, 0, 0], true_ang_vel))
-            true_angular_velocity_sequences.append(padded_true_ang_vel)
-        
-        true_angular_velocity_sequences = np.array(true_angular_velocity_sequences)
-        
-        # Predict using the model
-        predicted_angular_velocities = model.predict(val_image_batch)
-        
-           # Convert lists to numpy arrays for evaluation
-    all_predicted_angular_velocities = np.array(all_predicted_angular_velocities)
-    all_true_angular_velocities = np.array(all_true_angular_velocities)
-    
-    # Compute evaluation metrics
-    mae = mean_absolute_error(
-        all_true_angular_velocities.reshape(-1, 3),
-        all_predicted_angular_velocities.reshape(-1, 3)
-    )
+model.save(model_save_path)
+model.save_weights(weights_save_path)
 
-    print(f"Mean Absolute Error on validation set for fold {fold_index}: {mae}")
-    return mae
+# Evaluate the model on the testing sequence
+test_sequence = test_sequences[0]
+test_ic_am = test_ic_am[0]
+test_av = test_av[:20]  # Select first 20 for comparison
 
-# Perform the manual 5-fold cross-validation using 80:20 splits
-num_folds = 5
-mae_scores = []
+test_sequence = np.expand_dims(test_sequence, axis=0)
+test_ic_am = np.expand_dims(test_ic_am, axis=0)
 
-# Shuffle and split the data into 5 different training and validation sets
-for fold in range(num_folds):
-    print(f"Starting fold {fold+1}/{num_folds}")
+predicted_test_av = model.predict(test_sequence)
 
-    # Shuffle the data indices
-    np.random.shuffle(indices)
+# Display sample predictions
+def display_sample_predictions(predicted_av, true_av, num_samples=10, title='Sample Predicted vs Actual Angular Velocities'):
+    print(title)
+    for i in range(min(num_samples, len(predicted_av))):
+        print(f"Sample {i+1} - Predicted: {predicted_av[i]}, Actual: {true_av[i]}")
 
-    # Split the data into 80% training and 20% validation
-    train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=fold)
+# Sample size to display
+num_samples = 20
 
-    # Create train and validation label sets
-    train_labels = [labels_data[i] for i in train_indices]
-    val_labels = [labels_data[i] for i in val_indices]
+# Display sample predictions for testing sequence
+print("Testing Sequence - Sample Predictions:")
+display_sample_predictions(predicted_test_av, test_av, num_samples, 'Testing Sequence - Sample Predicted vs Actual Angular Velocities')
 
-    # Train and evaluate the model on this split
-    mae = train_and_evaluate(train_labels, val_labels, fold + 1)
-    mae_scores.append(mae)
+# Create a dataframe for the sample predictions
+df = pd.DataFrame({
+    'Predicted_x': predicted_test_av[:, 0],
+    'Predicted_y': predicted_test_av[:, 1],
+    'Predicted_z': predicted_test_av[:, 2],
+    'Actual_x': test_av[:, 0],
+    'Actual_y': test_av[:, 1],
+    'Actual_z': test_av[:, 2]
+})
 
-# Compute and print the average MAE across all folds
-average_mae = np.mean(mae_scores)
-print(f"Average Mean Absolute Error across all folds: {average_mae}")
+# Display the dataframe
+print(df.head(20))
 
-# Evaluate ensemble on test data
-# Paths to the test dataset and labels
-test_dataset_path = '/content/sample_data/speed/images/test'  # Replace with your test dataset path
-test_labels_path = '/content/sample_data/speed/test.json'  # Replace with your test labels JSON file path
+# Plotting the norm of the difference between predicted and actual angular velocities for the testing sequence
+test_diff_norms = np.linalg.norm(predicted_test_av - test_av, axis=1)
 
-# Load test dataset labels
-with open(test_labels_path, 'r') as f:
-    test_labels_data = json.load(f)
-
-# Create the test data generator
-test_data_generator = dataloader(test_labels_data, sequence_length=sequence_length, batch_size=64, type_data='test')
-
-all_predicted_angular_velocities = []
-all_true_angular_velocities = []
-
-# Generate predictions using ensemble of models
-for batch_images, batch_quaternions in test_data_generator:
-    batch_predictions = []
-
-    # Generate predictions for each model in the ensemble
-    for fold in range(num_folds):
-        model_path = f'pose_estimation_with_angular_velocity_fold_{fold+1}.h5'
-        model = load_model(model_path)
-        predicted_angular_velocities = model.predict(batch_images)
-        batch_predictions.append(predicted_angular_velocities)
-    
-    # Average the predictions
-    avg_predictions = np.mean(batch_predictions, axis=0)
-    
-    all_predicted_angular_velocities.extend(avg_predictions.tolist())
-    
-    # Compute true angular velocities for comparison
-    true_angular_velocity_sequences = []
-    timestamps = np.arange(sequence_length) * 0.1
-    
-    for quat_seq in batch_quaternions:
-        true_ang_vel = compute_angular_velocity(quat_seq.numpy(), timestamps)
-        padded_true_ang_vel = np.vstack(([0, 0, 0], true_ang_vel))
-        true_angular_velocity_sequences.append(padded_true_ang_vel)
-    
-    all_true_angular_velocities.extend(true_angular_velocity_sequences)
-
-# Convert lists to numpy arrays for evaluation
-all_predicted_angular_velocities = np.array(all_predicted_angular_velocities)
-all_true_angular_velocities = np.array(all_true_angular_velocities)
-
-# Compute evaluation metrics
-mae = mean_absolute_error(
-    all_true_angular_velocities.reshape(-1, 3),
-    all_predicted_angular_velocities.reshape(-1, 3)
-)
-
-print(f"Mean Absolute Error on Test Data with Ensembling: {mae}")
-
-# Optional: Compare a few predicted vs true angular velocities
-for i in range(min(5, len(all_predicted_angular_velocities))):
-    print(f"Sequence {i+1}")
-    print("True Angular Velocities:\n", all_true_angular_velocities[i])
-    print("Predicted Angular Velocities:\n", all_predicted_angular_velocities[i])
-    print("\n")
-
-    #
+plt.figure(figsize=(12, 6))
+plt.plot(test_diff_norms, label='Test Difference Norm')
+plt.title('Testing Sequence - Norm of Difference Between Predicted vs Actual Angular Velocity')
+plt.xlabel('Sample')
+plt.ylabel('Difference Norm')
+plt.legend()
+plt.show()
